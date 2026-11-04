@@ -1,0 +1,9 @@
+mss
+numpy
+pillow
+pynput
+pyperclip
+cryptography
+pystray
+dxcam
+pywin32; sys_platform == 'win32'
