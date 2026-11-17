@@ -1,4 +1,5 @@
 import base64
+import ipaddress
 import ctypes
 import hashlib
 import hmac
@@ -12,8 +13,10 @@ import threading
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 APP = "AnyKir"
-VERSION = "1.1.9"          # publish.py rewrites this line
-DEFAULT_RELAY_PORT = 7000
+VERSION = "1.51.9"
+APP_LOCK_SALT = "1Du++jnk9++xDFJzI/DlNw=="
+APP_LOCK_HASH = "jwyrmRxCTO6qLNZy82Pa/1YLNahVli+BzNc0E2+8mOE="
+APP_LOCK_ROUNDS = 200_000
 DEFAULT_DIRECT_PORT = 7001
 MAX_MSG = 64 * 1024 * 1024
 CHUNK = 256 * 1024
@@ -138,6 +141,16 @@ def send_line(sock, obj):
 def tune(sock):
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for option, value in (("TCP_KEEPIDLE", 4), ("TCP_KEEPINTVL", 2), ("TCP_KEEPCNT", 3)):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, option), value)
+        except (AttributeError, OSError):
+            pass
+    if sys.platform == "win32":
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, 5, 10)
+        except OSError:
+            pass
 
 
 def derive_key(password, peer_id):
@@ -217,6 +230,7 @@ def server_handshake(sock, key, host_id):
 
 SINGLE_PORT = 47653
 show_hook = {"fn": None}
+single_instance = {"answered": True}
 
 
 def acquire_single_instance():
@@ -224,9 +238,11 @@ def acquire_single_instance():
     try:
         srv.bind(("127.0.0.1", SINGLE_PORT))
     except OSError:
+        single_instance["answered"] = False
         try:
             with socket.create_connection(("127.0.0.1", SINGLE_PORT), timeout=2) as c:
                 c.sendall(b"show")
+                single_instance["answered"] = True
         except OSError:
             pass
         return False
@@ -245,3 +261,133 @@ def acquire_single_instance():
     threading.Thread(target=loop, daemon=True).start()
     globals()["_single_srv"] = srv
     return True
+
+
+def check_app_password(text):
+    salt, want = base64.b64decode(APP_LOCK_SALT), base64.b64decode(APP_LOCK_HASH)
+    got = hashlib.pbkdf2_hmac("sha256", (text or "").encode("utf-8"), salt, APP_LOCK_ROUNDS)
+    return hmac.compare_digest(got, want)
+
+
+_unlock_box = {"win": None, "entry": None}
+
+
+def unlock(parent=None, action="open", server=False):
+    import tkinter as tk
+    from tkinter import ttk
+    box = _unlock_box["win"]
+    if box is not None:
+        try:
+            if box.winfo_exists():
+                box.deiconify()
+                box.lift()
+                _unlock_box["entry"].focus_force()
+                return False
+        except tk.TclError:
+            pass
+    own = parent is None
+    if own:
+        parent = tk.Tk()
+        parent.withdraw()
+        try:
+            import logo
+            logo.tk_icon(parent, server)
+        except Exception:
+            pass
+    import ui
+    if own or parent not in ui._roots:
+        ui.apply(parent)
+        if not own:
+            ui.reveal(parent)
+    win = tk.Toplevel(parent)
+    _unlock_box["win"] = win
+    win.title(APP)
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    ui.themed_window(win)
+    result = {"ok": False, "tries": 0}
+    var, msg = tk.StringVar(), tk.StringVar()
+    f = ttk.Frame(win, padding=(22, 18, 22, 18))
+    f.pack(fill="both", expand=True)
+    top = ttk.Frame(f)
+    top.pack(fill="x", pady=(0, 12))
+    photo = ui.logo_image(top, 36, server)
+    if photo:
+        ttk.Label(top, image=photo).pack(side="left", padx=(0, 12))
+    texts = ttk.Frame(top)
+    texts.pack(side="left", fill="x")
+    ttk.Label(texts, text=f"{APP} password", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(texts, text=f"Enter it to {action}", style="Muted.TLabel").pack(anchor="w")
+    entry = ui.field(f, "Password", var, show="•", width=32)
+    _unlock_box["entry"] = entry
+    ttk.Label(f, textvariable=msg, style="Error.TLabel").pack(anchor="w", pady=(2, 0))
+    row = ttk.Frame(f)
+    row.pack(fill="x", pady=(8, 0))
+
+    def ok(*_):
+        if check_app_password(var.get()):
+            result["ok"] = True
+            win.destroy()
+            return
+        result["tries"] += 1
+        var.set("")
+        if result["tries"] >= 3:
+            win.destroy()
+        else:
+            msg.set("Wrong password")
+
+    ttk.Button(row, text="Unlock", style="Filled.TButton", command=ok).pack(side="right")
+    ttk.Button(row, text="Cancel", style="Text.TButton", command=win.destroy).pack(side="right", padx=(0, 6))
+    win.bind("<Return>", ok)
+    win.bind("<Escape>", lambda _e: win.destroy())
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    win.geometry(f"+{(win.winfo_screenwidth() - w) // 2}+{(win.winfo_screenheight() - h) // 3}")
+    win.deiconify()
+    win.lift()
+    ui.reveal(win)
+    entry.focus_force()
+    win.grab_set()
+    try:
+        win.wait_window()
+    finally:
+        _unlock_box["win"] = _unlock_box["entry"] = None
+    if own:
+        parent.destroy()
+    return result["ok"]
+
+
+def clean_allow_list(value):
+    items = value.replace(";", ",").replace("\n", ",").split(",") if isinstance(value, str) else list(value or [])
+    good, bad = [], []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            bad.append(text)
+            continue
+        entry = str(net.network_address) if net.num_addresses == 1 else str(net)
+        if entry not in good:
+            good.append(entry)
+    return good, bad
+
+
+def ip_allowed(cfg, ip):
+    if cfg.get("allow_from_mode") != "list":
+        return True
+    try:
+        addr = ipaddress.ip_address(str(ip or "").split("%")[0])
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    for item in cfg.get("allow_from") or []:
+        try:
+            if addr in ipaddress.ip_network(item, strict=False):
+                return True
+        except ValueError:
+            pass
+    return False

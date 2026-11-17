@@ -19,11 +19,13 @@ from common import CHUNK, T_CHUNK, VERSION, config_dir, load_json, save_json
 
 PUBLIC_KEY = "xcmp8bjQH/65z3xZz031DrEHMfnqRWSWPfjhLr+jIDk="
 FEED_PORT = 7002
-DEFAULT_SOURCES = ['http://100.123.9.43:7002']
+DEFAULT_SOURCES = ['http://192.168.210.112:7002', 'http://100.123.9.43:7002']
 CHECK_EVERY = 300
 MAX_RELEASE = 300 * 1024 * 1024
 EXE_NAME = "AnyKir.exe"
 META = os.path.join("release", "release.json")
+APK_NAME = "AnyKir.apk"
+ANDROID_META = os.path.join("release", "android.json")
 
 restart_args = []
 quit_hook = {"fn": None}
@@ -41,6 +43,22 @@ def newer(a, b):
 
 def signed_message(version, sha256_hex):
     return f"anykir-release-v1|{version}|{sha256_hex}".encode()
+
+
+def android_message(version, sha256_hex):
+    return f"anykir-android-v1|{version}|{sha256_hex}".encode()
+
+
+def android_staged():
+    meta = load_json(ANDROID_META)
+    if parse_version(meta.get("version")) and meta.get("sig") and os.path.exists(os.path.join(release_dir(), APK_NAME)):
+        return meta
+    return None
+
+
+def install_android(apk_path, version, sig):
+    shutil.copy2(apk_path, os.path.join(release_dir(), APK_NAME))
+    save_json(ANDROID_META, {"version": version, "sig": sig})
 
 
 def file_sha256(path):
@@ -214,14 +232,21 @@ def apply_if_staged():
     new = os.path.join(release_dir(), EXE_NAME)
     if not verify(new, meta["version"], meta["sig"]):
         return False
-    exe = sys.executable
+    import fastcopy
+    if fastcopy.is_fast():
+        exe = fastcopy.home_exe()
+        if not exe:
+            return _launch(new)
+    else:
+        exe = sys.executable
     aside = exe + ".old"
+    fallback = (lambda: _launch(new)) if fastcopy.is_fast() else (lambda: False)
     try:
         if os.path.exists(aside):
             os.remove(aside)
-        os.replace(exe, aside)      # a running exe can be renamed, just not overwritten
+        os.replace(exe, aside)
     except OSError:
-        return False
+        return fallback()
     try:
         shutil.copy2(new, exe)
     except OSError:
@@ -229,7 +254,11 @@ def apply_if_staged():
             os.replace(aside, exe)
         except OSError:
             pass
-        return False
+        return fallback()
+    return _launch(exe)
+
+
+def _launch(exe):
     env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1", ANYKIR_WAIT_PID=str(os.getpid()))
     subprocess.Popen([exe] + restart_args, env=env, close_fds=True,
                      creationflags=getattr(subprocess, "DETACHED_PROCESS", 8) | subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -310,24 +339,35 @@ def update_waiting():
 
 class _FeedHandler(BaseHTTPRequestHandler):
 
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _file(self, name, kind):
+        path = os.path.join(release_dir(), name)
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(os.path.getsize(path)))
+        self.end_headers()
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, self.wfile)
+
     def do_GET(self):
-        meta = staged()
+        meta, phone = staged(), android_staged()
         route = self.path.split("?")[0]
-        if meta and route == "/latest.json":
-            body = json.dumps({"version": meta["version"], "sig": meta["sig"], "file": EXE_NAME}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        if phone and route == "/android.json":
+            self._json({"version": phone["version"], "sig": phone["sig"], "file": APK_NAME,
+                        "size": os.path.getsize(os.path.join(release_dir(), APK_NAME))})
+        elif phone and route == "/" + APK_NAME:
+            self._file(APK_NAME, "application/vnd.android.package-archive")
+        elif meta and route == "/latest.json":
+            self._json({"version": meta["version"], "sig": meta["sig"], "file": EXE_NAME})
         elif meta and route == "/" + EXE_NAME:
-            path = os.path.join(release_dir(), EXE_NAME)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(os.path.getsize(path)))
-            self.end_headers()
-            with open(path, "rb") as f:
-                shutil.copyfileobj(f, self.wfile)
+            self._file(EXE_NAME, "application/octet-stream")
             try:
                 save_json("last_update_delivery.json", {"version": meta["version"],
                           "peer": self.client_address[0], "time": time.time(), "source": "feed"})
@@ -343,10 +383,20 @@ class _FeedHandler(BaseHTTPRequestHandler):
 _server = {"srv": None}
 
 
+class _FeedServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            import socket as _socket
+            self.socket.setsockopt(_socket.SOL_SOCKET, getattr(_socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
+        super().server_bind()
+
+
 def ensure_server():
     if _server["srv"] is None and staged():
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0", FEED_PORT), _FeedHandler)
+            srv = _FeedServer(("0.0.0.0", FEED_PORT), _FeedHandler)
         except OSError:
             return
         _server["srv"] = srv

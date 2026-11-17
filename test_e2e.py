@@ -21,32 +21,22 @@ def wait(cond, timeout=10, what=""):
     raise SystemExit(f"TIMEOUT waiting for {what}")
 
 
-relay = subprocess.Popen([PY, "relay.py", "--port", "7100", "--key", "k"], cwd=HERE, env=env)
-host = subprocess.Popen([PY, "host.py", "--nogui", "--relay", "127.0.0.1:7100", "--relay-key", "k",
-                         "--listen", "7101", "--set-password", "correct-horse"], cwd=HERE, env=env,
-                        stdout=subprocess.PIPE, text=True)
+host = subprocess.Popen([PY, "host.py", "--nogui", "--listen", "7101", "--set-password", "correct-horse"],
+                        cwd=HERE, env=env, stdout=subprocess.PIPE, text=True)
 try:
-    line = host.stdout.readline()
-    hid = line.split("ID:")[1].split()[0]
-    print("host id", hid)
+    host.stdout.readline()
     time.sleep(1.5)
 
     try:
-        ViewerSession().connect(hid, "nope", relay="127.0.0.1:7100", relay_key="k")
+        ViewerSession().connect("127.0.0.1:7101", "nope")
         raise SystemExit("FAIL: wrong password accepted")
     except (ConnectError, AuthError) as e:
         print("wrong password rejected:", e)
-    try:
-        ViewerSession().connect(hid, "correct-horse", relay="127.0.0.1:7100", relay_key="bad")
-        raise SystemExit("FAIL: bad relay key accepted")
-    except ConnectError as e:
-        print("bad relay key rejected:", e)
 
-    for label, kwargs in (("relay", dict(relay="127.0.0.1:7100", relay_key="k")),
-                          ("direct", dict(direct="127.0.0.1:7101"))):
+    for label in ("direct",):
         time.sleep(1.5)
         s = ViewerSession()
-        s.connect("" if "direct" in kwargs else hid, "correct-horse", **kwargs)
+        s.connect("127.0.0.1:7101", "correct-horse")
         wait(lambda: s.fb is not None and s.frames > 0, 10, f"first frame ({label})")
         print(f"[{label}] screen {s.fb.size}, frames so far {s.frames}")
 
@@ -83,4 +73,3 @@ try:
     print("ALL OK")
 finally:
     host.kill()
-    relay.kill()

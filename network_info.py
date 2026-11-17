@@ -13,18 +13,52 @@ def is_tailscale(value):
         return False
 
 
-def local_ips():
-    addresses = []
-    try:
-        addresses += [info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
-    except OSError:
-        pass
+def _tailscale_candidates():
     candidates = [os.path.join(root, "Tailscale", "tailscale.exe") for root in
                   (os.environ.get("ProgramW6432", r"C:\Program Files"),
                    os.environ.get("ProgramFiles", r"C:\Program Files"),
                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"))]
     candidates.append(shutil.which("tailscale") or "tailscale")
-    for executable in dict.fromkeys(candidates):
+    return list(dict.fromkeys(candidates))
+
+
+def _tailscale(*args, timeout=15):
+    for executable in _tailscale_candidates():
+        try:
+            return subprocess.run([executable, *args], capture_output=True, text=True, timeout=timeout,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def tailscale_state():
+    import json
+    reply = _tailscale("status", "--json", timeout=5)
+    if reply is None:
+        return None
+    try:
+        return "on" if json.loads(reply.stdout).get("BackendState") == "Running" else "off"
+    except ValueError:
+        return "off"
+
+
+def set_tailscale(on):
+    reply = _tailscale("up" if on else "down", timeout=30)
+    if reply is None:
+        return False, "Tailscale is not installed."
+    if reply.returncode != 0:
+        return False, (reply.stderr or reply.stdout).strip()[-400:] or f"tailscale exited with {reply.returncode}"
+    return True, ""
+
+
+def local_ips(tailscale=True):
+    addresses = []
+    try:
+        addresses += [info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
+    except OSError:
+        pass
+    for executable in (_tailscale_candidates() if tailscale else []):
         try:
             reply = subprocess.run([executable, "ip", "-4"], capture_output=True, text=True, timeout=3,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

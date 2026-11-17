@@ -1,6 +1,8 @@
+__import__("os").environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import argparse
 import ctypes
 import io
+from common import clean_allow_list, ip_allowed
 import json
 import os
 import platform
@@ -13,12 +15,13 @@ import sys
 import threading
 import time
 
+import hub
 import service_setup
 import updater
 import windows_desktop
 from desktop_capture import DesktopCapture
-from network_info import is_tailscale, kill_process, local_ips, port_owners, status_text
-from common import (APP, CHUNK, VERSION, acquire_single_instance, config_dir, show_hook, DEFAULT_DIRECT_PORT, DEFAULT_RELAY_PORT, T_CHUNK, T_FRAME, T_JSON,
+from network_info import is_tailscale, kill_process, local_ips, port_owners, set_tailscale, status_text, tailscale_state
+from common import (APP, CHUNK, VERSION, acquire_single_instance, config_dir, show_hook, unlock, DEFAULT_DIRECT_PORT, T_CHUNK, T_FRAME, T_JSON,
                     AuthError, derive_key, load_json, parse_addr, read_line, save_json, send_line,
                     server_handshake, tune)
 
@@ -36,11 +39,11 @@ def set_dpi_aware():
 
 set_dpi_aware()
 
-import mss  # noqa: E402  (must come after DPI awareness so coordinates are real pixels)
-import numpy as np  # noqa: E402
-import pyperclip  # noqa: E402
-from PIL import Image  # noqa: E402
-from pynput import keyboard, mouse  # noqa: E402
+import mss
+import numpy as np
+import pyperclip
+from PIL import Image
+from pynput import keyboard, mouse
 
 SPECIAL_KEYS = {
     "Return": "enter", "KP_Enter": "enter", "BackSpace": "backspace", "Tab": "tab", "ISO_Left_Tab": "tab",
@@ -57,6 +60,11 @@ for _i in range(1, 25):
     SPECIAL_KEYS[f"F{_i}"] = f"f{_i}"
 
 MSS = getattr(mss, "MSS", None) or mss.mss
+try:
+    import mss.windows.gdi as _mss_gdi
+    _mss_gdi.CAPTUREBLT = 0
+except Exception:
+    pass
 
 BUTTONS = {"left": mouse.Button.left, "right": mouse.Button.right, "middle": mouse.Button.middle}
 
@@ -213,6 +221,16 @@ def foreground_blocked():
 MAX_IN_FLIGHT = 6
 
 
+def _prewarm(delay=4.0):
+    time.sleep(delay)
+    try:
+        if sys.platform == "win32" and not windows_desktop.enabled:
+            import dxcam
+        Image.new("RGB", (16, 16)).save(io.BytesIO(), "JPEG", quality=65)
+    except Exception:
+        pass
+
+
 class Grabber:
 
     def __init__(self):
@@ -285,6 +303,23 @@ def changed_rects(arr, prev, gap=48, max_rects=4):
     return out
 
 
+class _GuiThreadInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("hwndActive", ctypes.c_void_p),
+                ("hwndFocus", ctypes.c_void_p), ("hwndCapture", ctypes.c_void_p), ("hwndMenuOwner", ctypes.c_void_p),
+                ("hwndMoveSize", ctypes.c_void_p), ("hwndCaret", ctypes.c_void_p), ("rcCaret", ctypes.c_long * 4)]
+
+
+def text_caret_active():
+    if sys.platform != "win32":
+        return False
+    u = ctypes.windll.user32
+    u.GetGUIThreadInfo.argtypes = [ctypes.c_uint32, ctypes.POINTER(_GuiThreadInfo)]
+    info = _GuiThreadInfo(cbSize=ctypes.sizeof(_GuiThreadInfo))
+    if not u.GetGUIThreadInfo(0, ctypes.byref(info)):
+        return False
+    return bool(info.hwndCaret)
+
+
 def secure_desktop_active():
     if sys.platform != "win32":
         return False
@@ -307,7 +342,7 @@ class HostSession:
         self.cfg = {"fps": 60, "quality": 65, "scale": 1.0, "monitor": 1}
         self.cfg_lock = threading.Lock()
         self.force_full = threading.Event()
-        self.frame, self.frame_cv = None, threading.Condition()
+        self.frame, self.frame_cv, self.frame_time = None, threading.Condition(), 0.0
         self.active_until = 0.0
         self.flow = threading.Condition()
         self.flow_on, self.sent, self.acked = False, 0, 0
@@ -324,6 +359,7 @@ class HostSession:
         threading.Thread(target=self._encode_loop, daemon=True).start()
         threading.Thread(target=self._clipboard_loop, daemon=True).start()
         threading.Thread(target=self._cursor_loop, daemon=True).start()
+        threading.Thread(target=self._caret_loop, daemon=True).start()
         try:
             kept = updater.staged()
             self.ch.send_json({"t": "hello", "host": socket.gethostname(), "os": platform.platform(),
@@ -374,9 +410,24 @@ class HostSession:
                 pass
         self.ch.close()
 
+    def _ctrl_alt_del(self):
+        if not self.injector.enabled or sys.platform != "win32":
+            return
+        if not windows_desktop.enabled:
+            self.ch.send_json({"t": "notice", "text": "Ctrl+Alt+Del and unlocking need the admin service on that PC "
+                                                      "(Share this PC > Advanced settings > Install admin service)."})
+            return
+        try:
+            import windows_service
+            windows_service.request_sas()
+        except Exception as exc:
+            self.ch.send_json({"t": "notice", "text": f"Ctrl+Alt+Del failed: {exc}"})
+
     def _handle(self, m):
         t = m.get("t")
-        if t in ("mouse", "wheel", "key", "combo", "lock"):
+        if t == "combo" and sorted(m.get("keys", [])) == ["alt", "ctrl", "delete"]:
+            t = "cad"
+        if t in ("mouse", "wheel", "key", "combo", "lock", "cad"):
             try:
                 self.input_desktop.sync(before_switch=self.injector.release_all)
             except OSError:
@@ -405,6 +456,8 @@ class HostSession:
         elif t == "lock":
             if self.injector.enabled and sys.platform == "win32":
                 ctypes.windll.user32.LockWorkStation()
+        elif t == "cad":
+            self._ctrl_alt_del()
         elif t == "cfg":
             with self.cfg_lock:
                 for k in ("fps", "quality", "scale", "monitor"):
@@ -524,7 +577,16 @@ class HostSession:
     def _clipboard_loop(self):
         if not self.service.cfg.get("allow_clipboard", True):
             return
+        if self.last_clip is None:
+            try:
+                self.last_clip = pyperclip.paste()
+            except Exception:
+                self.last_clip = ""
         while not self.stop.wait(0.8):
+            if not self.service.cfg.get("allow_clipboard", True):
+                continue
+            if not windows_desktop.input_is_default():
+                continue
             try:
                 text = pyperclip.paste()
             except Exception:
@@ -575,6 +637,46 @@ class HostSession:
         except OSError:
             pass
 
+    def _caret_loop(self):
+        if sys.platform != "win32":
+            return
+        desktop = windows_desktop.DesktopBinding()
+        state = {"probe": None}
+
+        def drop_probe():
+            if state["probe"]:
+                state["probe"].close()
+                state["probe"] = None
+        last = None
+        try:
+            while not self.stop.wait(0.25):
+                try:
+                    desktop.sync(before_switch=drop_probe)
+                except OSError:
+                    continue
+                if state["probe"] is None:
+                    try:
+                        from text_focus import FocusProbe
+                        state["probe"] = FocusProbe()
+                    except Exception:
+                        state["probe"] = False
+                probe = state["probe"]
+                try:
+                    caret = text_caret_active() or bool(probe and probe.editable())
+                    if caret != last:
+                        last = caret
+                        self.ch.send_json({"t": "caret", "on": caret})
+                except OSError:
+                    break
+                except Exception:
+                    pass
+        finally:
+            drop_probe() if state["probe"] else None
+            try:
+                desktop.close()
+            except OSError:
+                pass
+
     def _grab_loop(self):
         grabber, last = None, None
         capture_state = None
@@ -594,6 +696,11 @@ class HostSession:
                 t0 = time.time()
                 with self.cfg_lock:
                     cfg = dict(self.cfg)
+                with self.frame_cv:
+                    waiting = self.frame is not None and t0 - self.frame_time < 0.1
+                if waiting and not self.force_full.is_set():
+                    self.stop.wait(0.004)
+                    continue
                 try:
                     if desktop.sync(before_switch=release_capture):
                         last = None
@@ -622,6 +729,7 @@ class HostSession:
                     last = pix
                     with self.frame_cv:
                         self.frame = (pix, mon, count, cfg, grabber.name)
+                        self.frame_time = time.time()
                         self.frame_cv.notify()
                 if grabber.name == "dxgi":
                     interval = 1 / 120
@@ -666,13 +774,7 @@ class HostSession:
                     idx = min(max(int(cfg["monitor"]), 0), count)
                     scale = min(max(float(cfg["scale"]), 0.25), 1.0)
                     h, w = raw.shape
-                    if scale < 1.0:
-                        img = Image.frombuffer("RGB", (w, h), raw, "raw", "BGRX", 0, 1)
-                        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
-                        arr = np.frombuffer(img.tobytes("raw", "BGRX"), dtype=np.uint32).reshape(img.height, img.width)
-                    else:
-                        arr = raw
-                    fh, fw = arr.shape
+                    fw, fh = (max(1, int(w * scale)), max(1, int(h * scale))) if scale < 1.0 else (w, h)
 
                     key = (idx, scale, fw, fh)
                     if key != prev_key:
@@ -683,19 +785,31 @@ class HostSession:
                         self.force_full.clear()
                         prev = None
 
-                    rects = [(0, 0, fw, fh)] if prev is None else changed_rects(arr, prev)
-                    if not rects:
+                    changed = [(0, 0, w, h)] if prev is None else changed_rects(raw, prev)
+                    if not changed:
                         continue
                     quality = int(min(max(cfg["quality"], 10), 95))
-                    for x0, y0, x1, y1 in rects:
-                        region = np.ascontiguousarray(arr[y0:y1, x0:x1])
-                        im = Image.frombuffer("RGB", (x1 - x0, y1 - y0), region, "raw", "BGRX", 0, 1)
+                    sent = 0
+                    src = Image.frombuffer("RGB", (w, h), raw, "raw", "BGRX", 0, 1) if scale < 1.0 else None
+                    for x0, y0, x1, y1 in changed:
+                        if src is None:
+                            region = np.ascontiguousarray(raw[y0:y1, x0:x1])
+                            im = Image.frombuffer("RGB", (x1 - x0, y1 - y0), region, "raw", "BGRX", 0, 1)
+                        else:
+                            sx0, sy0 = x0 * fw // w, y0 * fh // h
+                            sx1, sy1 = min(fw, -(-x1 * fw // w)), min(fh, -(-y1 * fh // h))
+                            if sx1 <= sx0 or sy1 <= sy0:
+                                continue
+                            im = src.resize((sx1 - sx0, sy1 - sy0), Image.BILINEAR,
+                                            box=(sx0 * w / fw, sy0 * h / fh, sx1 * w / fw, sy1 * h / fh))
+                            x0, y0 = sx0, sy0
                         buf = io.BytesIO()
                         im.save(buf, "JPEG", quality=quality)
-                        self.ch.send(T_FRAME, struct.pack(">HHHH", x0, y0, x1 - x0, y1 - y0) + buf.getvalue())
-                    prev = arr
+                        self.ch.send(T_FRAME, struct.pack(">HHHH", x0, y0, im.width, im.height) + buf.getvalue())
+                        sent += 1
+                    prev = raw
                     with self.flow:
-                        self.sent += len(rects)
+                        self.sent += sent
                     self.active_until = max(self.active_until, time.time() + 1.0)
                 except OSError:
                     return
@@ -703,11 +817,15 @@ class HostSession:
                     prev = None
                     time.sleep(0.2)
                     continue
-                delay = 1.0 / max(1, min(int(cfg["fps"]), 60)) - (time.time() - t0)
+                work = time.time() - t0
+                delay = max(1.0 / max(1, min(int(cfg["fps"]), 60)) - work, work)
                 if delay > 0:
                     time.sleep(delay)
         finally:
             self.stop.set()
+
+
+_watch = {"svc": None, "started": False}
 
 
 class HostService:
@@ -720,11 +838,12 @@ class HostService:
         self.fails = []
         self.stopping = False
         self._lock = threading.Lock()
-        self._relay_sock = None
         self._listener = None
-        self._relay_gen = 0
+        self._gen = 0
         self.port_blocked = None
         self._service_seen = 0.0
+        self._hub_lines = []
+        self.on_stop = None
 
     def set_password(self, password):
         self.cfg["password"] = password
@@ -733,29 +852,63 @@ class HostService:
 
     def start(self):
         self.restart_network()
+        threading.Thread(target=_prewarm, daemon=True).start()
         updater.ensure_server()
         if not windows_desktop.enabled:
-            updater.Watcher(self._update_ready).start()
+            _watch["svc"] = self
+            if not _watch["started"]:
+                _watch["started"] = True
+                updater.Watcher(lambda: _watch["svc"] and _watch["svc"]._update_ready()).start()
 
     def _update_ready(self):
-        if not windows_desktop.enabled and not self.session:
+        if not windows_desktop.enabled and not self.session and not self.stopping:
             updater.restart_now()
 
+    def bind_ip(self):
+        ip = self.cfg.get("address")
+        return ip if self.cfg.get("only_address") and ip else ""
+
+    def shared_ips(self):
+        ip = self.bind_ip()
+        return [ip] if ip else local_ips()
+
     def restart_network(self):
-        self._relay_gen += 1
-        for s in (self._relay_sock, self._listener):
-            if s:
+        self._gen += 1
+        if self._listener:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+        self._listener = None
+        self.status = "Ready - waiting for connection"
+        threading.Thread(target=self._listen_loop, args=(self._gen,), daemon=True).start()
+        self._start_hub_lines(self._gen)
+
+    def _start_hub_lines(self, gen):
+        for line in self._hub_lines:
+            if line["sock"]:
                 try:
-                    s.close()
+                    line["sock"].close()
                 except OSError:
                     pass
-        self._relay_sock = self._listener = None
-        if self.cfg.get("relay"):
-            threading.Thread(target=self._relay_loop, args=(self._relay_gen,), daemon=True).start()
+        hello = lambda: {"id": self.cfg["id"], "name": socket.gethostname(), "ver": VERSION,
+                         "port": int(self.cfg.get("listen") or DEFAULT_DIRECT_PORT),
+                         "admin": windows_desktop.enabled, "svc": service_info()}
+        self._hub_lines = []
+        for address in hub.clean_hubs(self.cfg.get("hubs", hub.DEFAULT_HUBS)):
+            self._hub_lines.append(hub.call_home(
+                address, hello, self.serve, lambda: not self.stopping and gen == self._gen, self.shared_ips,
+                active=lambda: not self.yield_to_service(), on_stop=self._remote_stop, source=self.bind_ip))
+
+    def _remote_stop(self):
+        self.status = "Stopped by AnyKir Server"
+        if windows_desktop.enabled:
+            import windows_service
+            windows_service.stop_everything()
+        elif self.on_stop:
+            self.on_stop()
         else:
-            self.status = "Ready - waiting for connection"
-        if self.cfg.get("listen"):
-            threading.Thread(target=self._listen_loop, args=(self._relay_gen,), daemon=True).start()
+            self.stop()
 
     def disconnect_viewer(self):
         s = self.session
@@ -764,58 +917,19 @@ class HostService:
 
     def stop(self):
         self.stopping = True
-        self._relay_gen += 1
+        self._gen += 1
         self.disconnect_viewer()
-        for sock in (self._listener, self._relay_sock):
-            if sock:
+        for line in self._hub_lines:
+            if line["sock"]:
                 try:
-                    sock.close()
+                    line["sock"].close()
                 except OSError:
                     pass
-
-    def _relay_loop(self, gen):
-        backoff = 2
-        while not self.stopping and gen == self._relay_gen:
-            if self.yield_to_service():
-                self.status = "Shared through the admin service (same ID and password)"
-                time.sleep(5)
-                continue
+        if self._listener:
             try:
-                addr = parse_addr(self.cfg["relay"], DEFAULT_RELAY_PORT)
-                self.status = f"Connecting to relay {addr[0]}..."
-                s = socket.create_connection(addr, timeout=10)
-                tune(s)
-                self._relay_sock = s
-                send_line(s, {"op": "host", "id": self.cfg["id"], "sec": self.cfg["secret"],
-                              "key": self.cfg.get("relay_key", "")})
-                reply = json.loads(read_line(s))
-                if not reply.get("ok"):
-                    raise ConnectionError(reply.get("err", "relay refused"))
-                s.settimeout(90)
-                self._set_idle_status()
-                backoff = 2
-                while True:
-                    msg = json.loads(read_line(s))
-                    if msg.get("op") == "incoming":
-                        threading.Thread(target=self._accept_from_relay, args=(msg["token"], gen), daemon=True).start()
-            except Exception as e:
-                if gen != self._relay_gen:
-                    return
-                self.status = f"Offline ({e}); retrying..."
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-    def _accept_from_relay(self, token, gen):
-        try:
-            s = socket.create_connection(parse_addr(self.cfg["relay"], DEFAULT_RELAY_PORT), timeout=10)
-            tune(s)
-            send_line(s, {"op": "accept", "token": token, "key": self.cfg.get("relay_key", "")})
-            if not json.loads(read_line(s)).get("ok"):
-                s.close()
-                return
-            self.serve(s, "relay")
-        except Exception:
-            pass
+                self._listener.close()
+            except OSError:
+                pass
 
     SERVICE_GRACE = 90
 
@@ -823,47 +937,49 @@ class HostService:
         if windows_desktop.enabled or sys.platform != "win32":
             return False
         now = time.time()
-        if service_setup.state() == "running" and service_setup.installed_version():
+        if service_setup.state() == "running" and service_setup.follows_this_app():
             self._service_seen = now
             return True
         return now - self._service_seen < self.SERVICE_GRACE
 
     def _listen_loop(self, gen):
-        port = int(self.cfg["listen"])
-        while not self.stopping and gen == self._relay_gen:
+        port = int(self.cfg.get("listen") or DEFAULT_DIRECT_PORT)
+        while not self.stopping and gen == self._gen:
             if self.yield_to_service():
                 self.port_blocked = None
-                if not self.cfg.get("relay"):
-                    self.status = f"Shared through the admin service on port {port} (same password)"
+                self.status = f"Shared through the admin service on port {port} (same password)"
                 time.sleep(5)
                 continue
             srv = socket.socket()
             try:
                 if sys.platform == "win32":
-                    # Never share the port: with SO_REUSEADDR Windows splits connections between listeners.
                     srv.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
                 else:
                     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                srv.bind(("0.0.0.0", port))
+                srv.bind((self.bind_ip() or "0.0.0.0", port))
                 srv.listen(5)
             except OSError:
                 srv.close()
+                ip = self.bind_ip()
+                if ip and ip not in local_ips():
+                    self.port_blocked = None
+                    self.status = f"Waiting for {ip} - that address is not on this PC right now"
+                    time.sleep(5)
+                    continue
                 self.port_blocked = port_owners(port)
-                if not self.cfg.get("relay"):
-                    self.status = f"Port {port} is in use by another program - retrying"
+                self.status = f"Port {port} is in use by another program - retrying"
                 time.sleep(5)
                 continue
-            if gen != self._relay_gen or self.stopping:
+            if gen != self._gen or self.stopping:
                 srv.close()
                 return
             self._listener = srv
             if self.port_blocked is not None or self.status.startswith("Shared"):
                 self.port_blocked = None
-                if not self.cfg.get("relay"):
-                    self.status = "Ready - waiting for connection"
+                self.status = "Ready - waiting for connection"
             srv.settimeout(5)
             try:
-                while not self.stopping and gen == self._relay_gen:
+                while not self.stopping and gen == self._gen:
                     try:
                         s, addr = srv.accept()
                     except socket.timeout:
@@ -889,9 +1005,15 @@ class HostService:
         self.fails = [t for t in self.fails if now - t < 300]
         return len(self.fails) >= 5
 
-    def serve(self, sock, label):
+    def serve(self, sock, label, ip=None):
+        ip = label if ip is None else ip
+        if not ip_allowed(self.cfg, ip):
+            print(f"[{time.strftime('%H:%M:%S')}] refused {ip or 'an unknown address'} via {label}: "
+                  "not on the allowed list", flush=True)
+            sock.close()
+            return
         with self._lock:
-            if self.session or self._locked_out():
+            if self._locked_out():
                 sock.close()
                 return
         try:
@@ -904,12 +1026,20 @@ class HostService:
             sock.close()
             return
         with self._lock:
+            old = self.session
+        if old:
+            old.close()
+            for _ in range(50):
+                if self.session is not old:
+                    break
+                time.sleep(0.1)
+        with self._lock:
             if self.session:
                 ch.close()
                 return
             session = HostSession(ch, self, label)
             self.session = session
-        self.status = f"Connected: viewer via {label}"
+        self.status = f"Connected: viewer {ip} via {label}" if ip and ip != label else f"Connected: viewer via {label}"
         print(f"[{time.strftime('%H:%M:%S')}] viewer connected via {label}", flush=True)
         try:
             session.run()
@@ -933,13 +1063,16 @@ def load_config():
         "id": "".join(secrets.choice(string.digits) for _ in range(9)),
         "secret": secrets.token_hex(24),
         "password": new_password(),
-        "relay": "", "relay_key": "", "listen": DEFAULT_DIRECT_PORT, "allow_input": True, "allow_update": True,
+        "listen": DEFAULT_DIRECT_PORT, "hubs": list(hub.DEFAULT_HUBS), "allow_input": True, "allow_clipboard": True, "allow_update": True, "autostart": True,
     }
     for k, v in defaults.items():
         if k not in cfg:
             cfg[k] = v
             changed = True
-    if not cfg.get("relay") and not cfg.get("listen"):
+    for old in ("relay", "relay_key"):
+        if cfg.pop(old, None) is not None:
+            changed = True
+    if not cfg.get("listen"):
         cfg["listen"] = DEFAULT_DIRECT_PORT
         changed = True
     if changed:
@@ -947,9 +1080,21 @@ def load_config():
     return cfg
 
 
+def service_info():
+    if windows_desktop.enabled:
+        return {"ver": VERSION, "state": "running"}
+    try:
+        import windows_service
+        ver, st = windows_service.installed_version(), service_setup.state()
+    except Exception:
+        return {}
+    return {"ver": ver or "", "state": st} if st else {}
+
+
 def autostart_command():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" --minimized'
+        import fastcopy
+        return f'"{fastcopy.launcher()}" --minimized'
     pyw = sys.executable.replace("python.exe", "pythonw.exe")
     return f'"{pyw}" "{os.path.abspath(__file__)}" --minimized'
 
@@ -968,101 +1113,165 @@ def set_autostart(enable):
 
 
 def get_autostart():
+    return autostart_value() is not None
+
+
+def autostart_value():
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
-            winreg.QueryValueEx(k, APP + "Host")
-            return True
+            return winreg.QueryValueEx(k, APP + "Host")[0]
     except Exception:
-        return False
+        return None
+
+
+def refresh_autostart():
+    value = autostart_value()
+    if value is not None and value != autostart_command():
+        try:
+            set_autostart(True)
+        except OSError:
+            pass
 
 
 class HostApp:
     def __init__(self, root, service):
         import tkinter as tk
         from tkinter import ttk
-        self.tk, self.ttk, self.root, self.svc = tk, ttk, root, service
+        import ui
+        self.tk, self.ttk, self.ui, self.root, self.svc = tk, ttk, ui, root, service
+        self.back_to_menu = False
+        service.on_stop = lambda: root.after(0, self._quit_for_update)
         cfg = service.cfg
         self._keep = []
         root.title(f"{APP} - Share this PC")
-        root.resizable(False, False)
-        f = ttk.Frame(root, padding=20)
-        f.pack()
+        ui.window_size(root, 580, 900)
+        ui.appbar(root, VERSION, back=self._main_menu)
+        f = ui.scroll_area(root)
 
-        port = cfg.get("listen") or DEFAULT_DIRECT_PORT
-        addresses = local_ips()
-        ips = [f"{ip}:{port}" for ip in addresses]
-        self.addr = ips[0] if ips else ""
-        ttk.Label(f, text="To connect, enter this on your other PC:", font=("Segoe UI", 10)).pack(anchor="w")
-
-        def field(label, value, copy_value, extra=None):
-            r = ttk.Frame(f)
-            r.pack(fill="x", pady=(10, 0))
-            ttk.Label(r, text=label, width=10).pack(side="left")
-            var = tk.StringVar(value=value)
-            self._keep.append(var)  # Tk drops a variable when Python garbage-collects it
-            ttk.Label(r, textvariable=var, font=("Consolas", 15, "bold")).pack(side="left", padx=6)
-            ttk.Button(r, text="Copy", width=6, command=lambda: self._copy(copy_value())).pack(side="right")
-            if extra:
-                ttk.Button(r, text=extra[0], width=8, command=extra[1]).pack(side="right", padx=(0, 4))
-            return var
-
-        self.addr_var = field("Address", self.addr or "(no network)", lambda: self.addr)
-        self.pw_var = field("Password", cfg["password"], lambda: self.svc.cfg["password"],
-                            extra=("Change", self._set_pw))
-        note, color = status_text(addresses)
-        self.network_note = ttk.Label(f, text=note, foreground=color, wraplength=340)
-        self.network_note.pack(anchor="w", pady=(8, 0))
-        root.after(15000, self._refresh_network)
-        ttk.Label(f, text=f"{APP} v{VERSION}", foreground="#777").pack(anchor="e")
-
-        ttk.Separator(f).pack(fill="x", pady=14)
+        addresses = local_ips(tailscale=False)
+        self.addr = self._pick_address(addresses)
+        self.banner = ui.card(f, style="Ok.TFrame", padding=(16, 12))
+        texts = ttk.Frame(self.banner, style="OkPlain.TFrame")
+        texts.pack(side="left", fill="x", expand=True)
+        actions = ttk.Frame(self.banner, style="OkPlain.TFrame")
+        actions.pack(side="right", before=texts)
         self.status_var = tk.StringVar()
-        row = ttk.Frame(f)
-        row.pack(fill="x")
-        ttk.Label(row, textvariable=self.status_var, wraplength=250).pack(side="left")
-        self.kick = ttk.Button(row, text="Disconnect", command=service.disconnect_viewer)
-        self.kick.pack(side="right")
-        self.free_btn = ttk.Button(row, text="Free port", command=self._free_port)
+        self.status_lbl = ui.auto_wrap(ttk.Label(texts, textvariable=self.status_var, style="Ok.Title.TLabel"))
+        self.status_lbl.pack(anchor="w", fill="x")
+        note, _color = status_text(addresses)
+        self.network_note = ui.auto_wrap(ttk.Label(texts, text=note, style="Ok.Muted.TLabel"))
+        self.network_note.pack(anchor="w", fill="x")
+        self._banner_texts = texts
+        self._banner_actions = actions
+        self.kick = ttk.Button(actions, text="Disconnect", style="OkDanger.TButton", command=service.disconnect_viewer)
+        self.free_btn = ttk.Button(actions, text="Free port", style="OkTonal.TButton", command=self._free_port)
+        self._banner_kind = "Ok"
+        self.svc_note_card = ui.card(f, style="Warn.TFrame", padding=(16, 12))
+        self.svc_note = ui.auto_wrap(ttk.Label(self.svc_note_card, style="Warn.TLabel"))
+        self.svc_note.pack(anchor="w", fill="x")
+        self.svc_note_card.pack_forget()
         self._blocked_seen = None
         self._shared_by_service = False
 
+        self.headline = ui.headline(f, "Share this PC")
+        card = ui.card(f)
+        ttk.Label(card, text="Address", style="Card.Label.TLabel").pack(anchor="w")
+        r = ttk.Frame(card, style="Plain.TFrame")
+        r.pack(fill="x")
+        self.addr_var = tk.StringVar(value=self.addr or "(no network)")
+        self.addr_cb = ttk.Combobox(r, textvariable=self.addr_var, state="readonly", width=21,
+                                    style="Address.TCombobox", font=(ui.MONO, 17, "bold"))
+        self.addr_cb.pack(side="left")
+        self.addr_cb.bind("<<ComboboxSelected>>", self._choose_address)
+        ttk.Button(r, text="Copy", style="CardTonal.TButton", command=lambda: self._copy(self.addr)).pack(
+            side="right", before=self.addr_cb)
+        self.also = ui.auto_wrap(ttk.Label(card, style="Card.Small.TLabel"))
+        self.also.pack(anchor="w", fill="x")
+        r = ttk.Frame(card, style="Plain.TFrame")
+        r.pack(fill="x", pady=(8, 0))
+        ttk.Label(r, text="Share on", style="Card.Small.TLabel").pack(side="left", padx=(0, 8))
+        self._only_buttons = {}
+        for key, text in ((False, "All addresses"), (True, "Only this address")):
+            b = ttk.Button(r, text=text, command=lambda k=key: self._set_only_address(k))
+            b.pack(side="left", padx=(0, 6))
+            self._only_buttons[key] = b
+        self._fill_addresses(addresses)
+        ui.divider(card, pady=10)
+        ttk.Label(card, text="Password", style="Card.Label.TLabel").pack(anchor="w")
+        r = ttk.Frame(card, style="Plain.TFrame")
+        r.pack(fill="x")
+        self.pw_var = tk.StringVar()
+        pw_lbl = ttk.Label(r, textvariable=self.pw_var, style="Card.Big.TLabel")
+        pw_lbl.pack(side="left")
+        ttk.Button(r, text="Copy", style="CardTonal.TButton",
+                   command=lambda: self._copy(self.svc.cfg["password"])).pack(side="right", before=pw_lbl)
+        self.addr_cb.configure(font=(ui.MONO, 17, "bold"))
+        ui.fit_font(card, [self.addr_cb], (ui.MONO, 17, "bold"), (ui.MONO, 12, "bold"))
+        ui.fit_font(card, [pw_lbl], (ui.MONO, 17, "bold"), (ui.MONO, 12, "bold"))
+        self._buttons = {}
+        for text, cmd in (("Change", self._set_pw), ("Show", self._toggle_pw)):
+            b = ttk.Button(r, text=text, style="CardText.TButton", command=cmd)
+            b.pack(side="right", padx=(0, 2), before=pw_lbl)
+            self._buttons[text] = b
+        self._pw_visible = False
+        self._show_pw()
+
+        settings = self.settings = ui.card(f, padding=(16, 4))
+        self.ts_var = tk.BooleanVar(value=False)
+        self.ts_row = ui.setting_row(settings, "Tailscale", "Reach this PC from anywhere", self.ts_var,
+                                     command=self._toggle_tailscale)
+        self.ts_btn = self.ts_row.switch
+        self._ts_state = None
+        first_row = None
         if sys.platform == "win32":
-            self.auto_var = tk.BooleanVar(value=get_autostart())
-            ttk.Checkbutton(f, text="Start automatically with Windows", variable=self.auto_var,
-                            command=lambda: set_autostart(self.auto_var.get())).pack(anchor="w", pady=(12, 0))
-
-        self.adv = ttk.Frame(f)
-        self.adv_open = False
-        self.adv_btn = ttk.Button(f, text="Advanced settings", command=self._toggle_adv)
-        self.adv_btn.pack(anchor="w", pady=(10, 0))
-        ttk.Button(self.adv, text="Make a new password", command=self._new_pw).pack(anchor="w", pady=4)
+            want = bool(cfg.get("autostart", True))
+            if want != get_autostart() or (want and autostart_value() != autostart_command()):
+                try:
+                    set_autostart(want)
+                except OSError:
+                    pass
+            self.auto_var = tk.BooleanVar(value=want)
+            first_row = ui.setting_row(settings, "Start with Windows", "Share this PC as soon as you sign in",
+                                       self.auto_var, command=self._save_autostart)
         self.input_var = tk.BooleanVar(value=cfg["allow_input"])
-        ttk.Checkbutton(self.adv, text="Allow remote control (untick = view only)", variable=self.input_var,
-                        command=self._save_input).pack(anchor="w", pady=2)
-        self.relay_var = tk.StringVar(value=cfg["relay"])
-        self.rkey_var = tk.StringVar(value=cfg["relay_key"])
-        self.listen_var = tk.StringVar(value=str(cfg["listen"] or ""))
-        self.usrc_var = tk.StringVar(value=", ".join(updater.user_sources()))
-        for label, var in (("Relay server (optional)", self.relay_var), ("Relay key", self.rkey_var),
-                           ("Port", self.listen_var), ("Update source (optional)", self.usrc_var)):
-            r = ttk.Frame(self.adv)
-            r.pack(fill="x", pady=2)
-            ttk.Label(r, text=label, width=22).pack(side="left")
-            ttk.Entry(r, textvariable=var, width=20).pack(side="left")
-        ttk.Button(self.adv, text="Save and reconnect", command=self._save_net).pack(anchor="e", pady=4)
-
-        self.svc_note = ttk.Label(f, foreground="#a15c00", wraplength=340)
         self.svc_btn = None
-        if service_setup.available() or service_setup.state() is not None:
-            ttk.Separator(self.adv).pack(fill="x", pady=8)
-            r = ttk.Frame(self.adv)
-            r.pack(fill="x", pady=2)
-            self.svc_label = ttk.Label(r, wraplength=170)
-            self.svc_label.pack(side="left")
-            self.svc_btn = ttk.Button(r, command=self._toggle_service)
+        has_service = service_setup.available() or service_setup.state() is not None
+        ui.setting_row(settings, "Allow remote control", "Off = the other side can only watch", self.input_var,
+                       command=self._save_input)
+        row = self._who_row(settings, last=not has_service)
+        self._after_ts = first_row or row
+        if has_service:
+            row = ui.setting_row(settings, "Admin service", "", last=True)
+            self.svc_label = row.sub
+            row.sub.pack(anchor="w", fill="x")
+            self.svc_btn = ttk.Button(row.right, style="CardText.TButton", command=self._toggle_service)
             self.svc_btn.pack(side="right")
-            self.svc_reinstall = ttk.Button(r, text="Reinstall", command=lambda: self._toggle_service(reinstall=True))
+            self.svc_reinstall = ttk.Button(row.right, text="Reinstall", style="CardText.TButton",
+                                            command=lambda: self._toggle_service(reinstall=True))
+        self._show_tailscale(None)
+        threading.Thread(target=lambda: self._later(self._show_tailscale, tailscale_state()), daemon=True).start()
+        root.after(300, self._refresh_network)
+
+        self.adv = ui.expander(f, "Advanced settings")
+        self.adv.head.pack_configure(fill="none", anchor="w", pady=(2, 0))
+        self.adv_btn = self.adv.head
+        self.listen_var = tk.StringVar(value=str(cfg["listen"] or DEFAULT_DIRECT_PORT))
+        self.usrc_var = tk.StringVar(value=", ".join(updater.user_sources() or updater.DEFAULT_SOURCES))
+        self.hubs_var = tk.StringVar(value=", ".join(hub.clean_hubs(cfg.get("hubs", hub.DEFAULT_HUBS))))
+        for label, var in (("Port", self.listen_var), ("AnyKir Server", self.hubs_var),
+                           ("Update source", self.usrc_var)):
+            ui.field(self.adv, label, var, on_enter=self._save_net)
+        r = ttk.Frame(self.adv)
+        r.pack(fill="x", pady=(8, 0))
+        ttk.Button(r, text="Save and reconnect", style="Tonal.TButton", command=self._save_net).pack(side="right")
+        if sys.platform == "win32":
+            self.fw_btn = ttk.Button(r, text="Allow through firewall", style="Text.TButton",
+                                     command=lambda: self._allow_firewall(True))
+            self.fw_btn.pack(side="left")
+            root.after(1500, self._check_firewall)
+        ttk.Label(self.adv, text="Appearance", style="Label.TLabel").pack(anchor="w", pady=(14, 6))
+        ui.appearance(self.adv).pack(anchor="w")
         self._show_service_state()
 
         self.tray = self._make_tray()
@@ -1071,15 +1280,17 @@ class HostApp:
         root.protocol("WM_DELETE_WINDOW", self._close_window)
         self._tick()
 
+    def _later(self, fn, *args):
+        try:
+            self.root.after(0, lambda: fn(*args))
+        except RuntimeError:
+            pass
+
     def _make_tray(self):
         try:
             import pystray
-            from PIL import ImageDraw
-            img = Image.new("RGB", (64, 64), "#1e6fd9")
-            d = ImageDraw.Draw(img)
-            d.rectangle((10, 14, 54, 42), outline="white", width=4)
-            d.rectangle((26, 44, 38, 50), fill="white")
-            d.rectangle((18, 50, 46, 54), fill="white")
+            import logo
+            img = logo.image(64)
             menu = pystray.Menu(
                 pystray.MenuItem("Open", lambda: self.root.after(0, self.show), default=True),
                 pystray.MenuItem("Disconnect viewer", lambda: self.svc.disconnect_viewer()),
@@ -1091,18 +1302,27 @@ class HostApp:
             return None
 
     def show(self):
+        if self.root.state() == "withdrawn" and not unlock(self.root, "open"):
+            return
         self.root.deiconify()
         self.root.lift()
+
+    def _save_autostart(self):
+        self.svc.cfg["autostart"] = self.auto_var.get()
+        save_json("host.json", self.svc.cfg)
+        set_autostart(self.auto_var.get())
 
     def _refresh_network(self):
         def probe():
             addresses = local_ips()
+            ts = tailscale_state()
             def apply():
-                port = self.svc.cfg.get("listen") or DEFAULT_DIRECT_PORT
-                self.addr = f"{addresses[0]}:{port}" if addresses else ""
+                self.addr = self._pick_address(addresses)
                 self.addr_var.set(self.addr or "(no network)")
+                self._fill_addresses(addresses)
+                self._show_tailscale(ts)
                 note, color = status_text(addresses)
-                self.network_note.configure(text=note, foreground=color)
+                self.network_note.configure(text=note)
                 self._show_service_state()
                 self.root.after(15000, self._refresh_network)
             try:
@@ -1110,6 +1330,145 @@ class HostApp:
             except RuntimeError:
                 pass
         threading.Thread(target=probe, daemon=True).start()
+
+    def _pick_address(self, addresses):
+        port = self.svc.cfg.get("listen") or DEFAULT_DIRECT_PORT
+        chosen = self.svc.cfg.get("address")
+        ip = chosen if chosen in addresses else (addresses[0] if addresses else "")
+        return f"{ip}:{port}" if ip else ""
+
+    def _fill_addresses(self, addresses):
+        self._addresses = list(addresses)
+        only = bool(self.svc.cfg.get("only_address"))
+        for key, b in getattr(self, "_only_buttons", {}).items():
+            b.configure(style="CardSegOn.TButton" if key == only else "CardSeg.TButton")
+        port = self.svc.cfg.get("listen") or DEFAULT_DIRECT_PORT
+        self.addr_cb["values"] = [f"{ip}:{port}" + ("  (Tailscale)" if is_tailscale(ip) else "") for ip in addresses]
+        self.addr_cb.configure(width=max(len(self.addr or "(no network)"), 12))
+        others = [f"{ip}:{port}" + (" (Tailscale)" if is_tailscale(ip) else "") for ip in addresses
+                  if f"{ip}:{port}" != self.addr]
+        if only:
+            self.also.configure(text="Only this address accepts viewers" +
+                                (f" (not used: {len(others)} other)" if len(others) == 1 else
+                                 f" (not used: {len(others)} others)" if others else ""))
+        else:
+            self.also.configure(text=("Also: " + ",  ".join(others[:3])) if others else "")
+
+    def _choose_address(self, _e=None):
+        value = self.addr_var.get().split()[0]
+        before = self.svc.bind_ip()
+        self.svc.cfg["address"] = value.rsplit(":", 1)[0]
+        save_json("host.json", self.svc.cfg)
+        self.addr = value
+        self.addr_var.set(value)
+        self._fill_addresses(getattr(self, "_addresses", []))
+        if self.svc.bind_ip() != before:
+            self.svc.restart_network()
+
+    def _set_only_address(self, only):
+        cfg = self.svc.cfg
+        if only:
+            ip = (self.addr or "").rsplit(":", 1)[0]
+            if not ip:
+                return
+            cfg["address"] = ip
+        if bool(cfg.get("only_address")) == only and not only:
+            return
+        before = self.svc.bind_ip()
+        cfg["only_address"] = only
+        save_json("host.json", cfg)
+        self._fill_addresses(getattr(self, "_addresses", []))
+        if self.svc.bind_ip() != before:
+            self.svc.restart_network()
+
+    def _show_tailscale(self, state):
+        self._ts_state = state
+        if state is None:
+            self.ts_row.pack_forget()
+            return
+        self.ts_var.set(state == "on")
+        self.ts_btn.state(["!disabled"])
+        self.ts_row.sub.configure(text="On - reach this PC from anywhere" if state == "on"
+                                  else "Off - only this network can reach this PC")
+        if not self.ts_row.winfo_ismapped():
+            self.ts_row.pack(fill="x", before=self._after_ts)
+
+    def _toggle_tailscale(self):
+        from tkinter import messagebox
+        turn_on = self._ts_state != "on"
+        if not turn_on:
+            text = ("Turn Tailscale off on this PC?\n\n"
+                    "Viewers connecting through a Tailscale (100.x) address lose access.")
+            if self.svc.session:
+                text += "\n\nA viewer is connected now and may be disconnected."
+            if not messagebox.askyesno(APP, text, parent=self.root):
+                self.ts_var.set(True)
+                return
+        self.ts_btn.state(["disabled"])
+        self.ts_row.sub.configure(text="Turning on..." if turn_on else "Turning off...")
+
+        def work():
+            ok, err = set_tailscale(turn_on)
+            addresses, state = local_ips(), tailscale_state()
+
+            def done():
+                self._show_tailscale(state)
+                self.addr = self._pick_address(addresses)
+                self.addr_var.set(self.addr or "(no network)")
+                self._fill_addresses(addresses)
+                note, color = status_text(addresses)
+                self.network_note.configure(text=note)
+                if not ok:
+                    messagebox.showerror(APP, "Tailscale: " + err, parent=self.root)
+            try:
+                self.root.after(0, done)
+            except RuntimeError:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _check_firewall(self):
+        import windows_service
+        port = self.svc.cfg.get("listen") or DEFAULT_DIRECT_PORT
+
+        def probe():
+            ready = windows_service.firewall_ready(port)
+            if not ready:
+                try:
+                    self.root.after(0, lambda: self._allow_firewall(False))
+                except RuntimeError:
+                    pass
+        threading.Thread(target=probe, daemon=True).start()
+
+    def _allow_firewall(self, asked):
+        from tkinter import messagebox
+        port = self.svc.cfg.get("listen") or DEFAULT_DIRECT_PORT
+        if not asked:
+            if self.root.state() == "withdrawn" or getattr(self, "_fw_asked", False):
+                return
+            self._fw_asked = True
+            if not messagebox.askyesno(APP, f"Windows Firewall is not set to let other PCs reach AnyKir on port {port}."
+                                            "\n\nAllow it now? Windows will ask for administrator permission.",
+                                       parent=self.root):
+                return
+        self.fw_btn.state(["disabled"])
+
+        def work():
+            import windows_service
+            service_setup.run_elevated("allow-firewall", port)
+            ready = windows_service.firewall_ready(port)
+
+            def done():
+                self.fw_btn.state(["!disabled"])
+                if ready:
+                    messagebox.showinfo(APP, f"AnyKir is allowed through Windows Firewall (port {port}, 7002 and ping).",
+                                        parent=self.root)
+                else:
+                    messagebox.showwarning(APP, "The firewall rule was not added.", parent=self.root)
+            try:
+                self.root.after(0, done)
+            except RuntimeError:
+                pass
+        threading.Thread(target=work, daemon=True).start()
 
     def hide(self):
         self.root.withdraw()
@@ -1127,7 +1486,7 @@ class HostApp:
             self._shared_by_service = bool(blocked) and self._service_follows() and all(
                 service_setup.is_service_agent(p) or not p for _, p in blocked)
             if blocked and not self._shared_by_service:
-                self.free_btn.pack(side="right", padx=(0, 4))
+                self.free_btn.pack(side="right", padx=(6, 0))
             else:
                 self.free_btn.pack_forget()
         if blocked:
@@ -1136,7 +1495,13 @@ class HostApp:
                                if self._shared_by_service else f"Port {port} is in use by {self._describe(blocked)}")
         self.status_var.set(self.svc.status)
         connected = self.svc.session is not None
-        self.kick.state(["!disabled"] if connected else ["disabled"])
+        if connected and not self.kick.winfo_ismapped():
+            self.kick.pack(side="right", padx=(6, 0))
+        elif not connected and self.kick.winfo_ismapped():
+            self.kick.pack_forget()
+        status = self.svc.status
+        trouble = (blocked and not self._shared_by_service) or status.startswith(("Stopped", "Port", "Starting"))
+        self._paint_banner("Warn" if trouble else "Ok")
         self.root.title(f"{APP} - Share this PC" + ("  -  SOMEONE IS CONNECTED" if connected else ""))
         if self.tray:
             try:
@@ -1145,45 +1510,176 @@ class HostApp:
                 pass
         self.root.after(500, self._tick)
 
+    def _paint_banner(self, kind):
+        if kind == self._banner_kind:
+            return
+        self._banner_kind = kind
+        self.banner.configure(style=f"{kind}.TFrame")
+        for frame in (self._banner_texts, self._banner_actions):
+            frame.configure(style=f"{kind}Plain.TFrame")
+        self.status_lbl.configure(style=f"{kind}.Title.TLabel")
+        self.network_note.configure(style=f"{kind}.Muted.TLabel")
+        self.kick.configure(style=f"{kind}Danger.TButton")
+        self.free_btn.configure(style=f"{kind}Tonal.TButton")
+
     def _copy(self, text):
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
 
+    def _show_pw(self):
+        pw = self.svc.cfg["password"]
+        self.pw_var.set(pw if self._pw_visible else "•" * min(len(pw), 12))
+        self._buttons["Show"].configure(text="Hide" if self._pw_visible else "Show")
+
+    def _toggle_pw(self):
+        self._pw_visible = not self._pw_visible
+        self._show_pw()
+
     def _new_pw(self):
         self.svc.set_password(new_password())
-        self.pw_var.set(self.svc.cfg["password"])
+        self._show_pw()
 
     def _set_pw(self):
-        from tkinter import messagebox, simpledialog
-        pw = simpledialog.askstring(APP, "Type the password you want to use to connect\n"
-                                         "(at least 8 characters, a long one is safer):", parent=self.root)
-        if pw is None:
-            return
-        pw = pw.strip()
-        if len(pw) < 8:
-            messagebox.showwarning(APP, "That password is too short. Use at least 8 characters.", parent=self.root)
-            return
-        self.svc.set_password(pw)
-        self.pw_var.set(pw)
+        tk, ttk, ui = self.tk, self.ttk, self.ui
+        win = tk.Toplevel(self.root)
+        win.title(APP)
+        win.resizable(False, False)
+        win.transient(self.root)
+        ui.themed_window(win)
+        f = ttk.Frame(win, padding=(22, 18))
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Change password", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(f, text="Use at least 8 characters. A long one is safer.", style="Muted.TLabel").pack(anchor="w",
+                                                                                                    pady=(0, 8))
+        var = tk.StringVar()
+        entry = ui.field(f, "New password", var, show="\u2022", width=34)
+        msg = ttk.Label(f, style="Error.TLabel")
+        msg.pack(anchor="w")
+
+        def random():
+            var.set(new_password())
+            entry.configure(show="")
+            entry.icursor("end")
+
+        def save(*_):
+            pw = var.get().strip()
+            if len(pw) < 8:
+                msg.configure(text="That password is too short. Use at least 8 characters.")
+                return
+            self.svc.set_password(pw)
+            self._show_pw()
+            win.destroy()
+        r = ttk.Frame(f)
+        r.pack(fill="x", pady=(8, 0))
+        ttk.Button(r, text="Random", style="Text.TButton", command=random).pack(side="left")
+        ttk.Button(r, text="Save", style="Filled.TButton", command=save).pack(side="right")
+        ttk.Button(r, text="Cancel", style="Text.TButton", command=win.destroy).pack(side="right", padx=(0, 6))
+        entry.bind("<Return>", save)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + 120
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        ui.reveal(win)
+        entry.focus_force()
+        win.grab_set()
 
     def _toggle_adv(self):
-        self.adv_open = not self.adv_open
-        if self.adv_open:
-            self.adv.pack(after=self.adv_btn, fill="x", pady=(6, 0))
-        else:
-            self.adv.pack_forget()
+        self.adv.toggle()
 
     def _save_net(self):
         cfg = self.svc.cfg
-        cfg["relay"] = self.relay_var.get().strip()
-        cfg["relay_key"] = self.rkey_var.get().strip()
         try:
-            cfg["listen"] = int(self.listen_var.get() or 0)
+            cfg["listen"] = int(self.listen_var.get()) if 0 < int(self.listen_var.get()) < 65536 else DEFAULT_DIRECT_PORT
         except ValueError:
-            cfg["listen"] = 0
+            cfg["listen"] = DEFAULT_DIRECT_PORT
+        self.listen_var.set(str(cfg["listen"]))
         save_json("host.json", cfg)
         updater.set_sources(self.usrc_var.get())
+        cfg["hubs"] = hub.clean_hubs(self.hubs_var.get())
+        self.hubs_var.set(", ".join(cfg["hubs"]))
+        save_json("host.json", cfg)
         self.svc.restart_network()
+        self.root.after(500, self._check_firewall)
+
+    def _who_row(self, parent, last):
+        ttk = self.ttk
+        row = self.ui.setting_row(parent, "Who can connect", "", last=last)
+        row.sub.pack(anchor="w", fill="x")
+        self._who_label = row.sub
+        self._who_buttons = {}
+        for key, text in (("list", "Only these"), ("all", "Anyone")):
+            b = ttk.Button(row.right, text=text, command=lambda k=key: self._pick_who(k))
+            b.pack(side="right", padx=(6, 0))
+            self._who_buttons[key] = b
+        self._show_who()
+        return row
+
+    def _show_who(self):
+        cfg = self.svc.cfg
+        mode = "list" if cfg.get("allow_from_mode") == "list" else "all"
+        for key, b in self._who_buttons.items():
+            b.configure(style="CardSegOn.TButton" if key == mode else "CardSeg.TButton")
+        listed = cfg.get("allow_from") or []
+        if mode == "list":
+            shown = ", ".join(listed[:4]) + (f" and {len(listed) - 4} more" if len(listed) > 4 else "")
+            self._who_label.configure(text=f"Only {shown} (with the password) - click Only these to edit")
+        else:
+            self._who_label.configure(text="Anyone with the password")
+
+    def _pick_who(self, mode):
+        if mode == "list":
+            self._edit_who()
+            return
+        self.svc.cfg["allow_from_mode"] = "all"
+        save_json("host.json", self.svc.cfg)
+        self._show_who()
+
+    def _edit_who(self):
+        tk, ttk, ui = self.tk, self.ttk, self.ui
+        win = tk.Toplevel(self.root)
+        win.title(APP)
+        win.resizable(False, False)
+        win.transient(self.root)
+        ui.themed_window(win)
+        f = ttk.Frame(win, padding=(22, 18))
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Only these addresses", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(f, text="Viewers from other addresses are refused before the password.\n"
+                          "Separate with commas. 192.168.1.0/24 = every 192.168.1.x address.",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(0, 8))
+        var = tk.StringVar(value=", ".join(self.svc.cfg.get("allow_from") or []))
+        entry = ui.field(f, "Allowed addresses", var, width=44)
+        msg = ttk.Label(f, style="Error.TLabel")
+        msg.pack(anchor="w")
+
+        def save(*_):
+            good, bad = clean_allow_list(var.get())
+            if bad:
+                msg.configure(text="Not an address: " + ", ".join(bad[:3]))
+                return
+            if not good:
+                msg.configure(text="Add at least one address (or choose Anyone).")
+                return
+            self.svc.cfg["allow_from"] = good
+            self.svc.cfg["allow_from_mode"] = "list"
+            save_json("host.json", self.svc.cfg)
+            self._show_who()
+            win.destroy()
+        r = ttk.Frame(f)
+        r.pack(fill="x", pady=(8, 0))
+        ttk.Button(r, text="Save", style="Filled.TButton", command=save).pack(side="right")
+        ttk.Button(r, text="Cancel", style="Text.TButton", command=win.destroy).pack(side="right", padx=(0, 6))
+        entry.bind("<Return>", save)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + 120
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        ui.reveal(win)
+        entry.focus_force()
+        entry.icursor("end")
+        win.grab_set()
 
     def _save_input(self):
         self.svc.cfg["allow_input"] = self.input_var.get()
@@ -1235,7 +1731,7 @@ class HostApp:
 
     @staticmethod
     def _service_follows():
-        return service_setup.state() == "running" and service_setup.installed_version() is not None
+        return service_setup.state() == "running" and service_setup.follows_this_app()
 
     def _show_service_state(self):
         st = service_setup.state()
@@ -1244,24 +1740,26 @@ class HostApp:
             self.svc_note.configure(text="The admin service is an old version with its own password. "
                                          "Click Reinstall under Advanced settings once; after that it "
                                          "follows this window and updates itself.")
-            self.svc_note.pack(anchor="w", pady=(8, 0), after=self.network_note)
+            if not self.svc_note_card.winfo_ismapped():
+                self.svc_note_card.pack(fill="x", pady=(0, 10), after=self.banner)
         else:
-            self.svc_note.pack_forget()
+            self.svc_note_card.pack_forget()
         self._blocked_seen = object()
         if self.svc_btn is None:
             return
         if st and ver:
-            state_text = f"Admin/UAC service v{ver}: {'running' if st == 'running' else 'stopped'}"
+            state_text = (f"v{ver} {'running' if st == 'running' else 'installed, stopped'} - works with admin "
+                          "windows and the lock screen")
             if updater.newer(VERSION, ver):
                 state_text += f" (updating to v{VERSION})"
         else:
-            state_text = {"running": "Admin/UAC service: running (old version)",
-                          "stopped": "Admin/UAC service: installed, stopped"}.get(st, "Admin/UAC service: not installed")
+            state_text = {"running": "Running (old version)", "stopped": "Installed, stopped"}.get(
+                st, "Not installed - needed for admin windows, UAC prompts and the lock screen")
         self.svc_label.configure(text=state_text)
-        self.svc_btn.configure(text="Remove" if st else "Install admin service")
+        self.svc_btn.configure(text="Remove" if st else "Install")
         self.svc_btn.state(["!disabled"])
         if st and service_setup.available():
-            self.svc_reinstall.pack(side="right", padx=(0, 4))
+            self.svc_reinstall.pack(side="right", padx=(0, 2))
             self.svc_reinstall.state(["!disabled"])
         else:
             self.svc_reinstall.pack_forget()
@@ -1281,8 +1779,8 @@ class HostApp:
                         "It lets you control administrator windows and UAC prompts, and keeps this PC reachable "
                         "at the Windows sign-in screen.") + (
                         "\n\nWindows will ask for administrator permission. Afterwards the service shares this PC "
-                        "with the same address and password and this window closes. File transfer and clipboard "
-                        "are not available through the service.")
+                        "with the same address and password, and this window stays open. Copy and paste works "
+                        "through the service; file transfer needs this window.")
         if not messagebox.askyesno(APP, question, parent=self.root):
             return
         self.svc_btn.state(["disabled"])
@@ -1300,14 +1798,13 @@ class HostApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _service_done(self, installed_ok):
-        if installed_ok and service_setup.state() == "running":
-            if get_autostart():
-                set_autostart(False)
-            self._quit_for_update()
-            return
         self.svc.stopping = False
         self.svc.restart_network()
         self._show_service_state()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(300, lambda: self.root.attributes("-topmost", False))
 
     def _quit_for_update(self):
         self.svc.stop()
@@ -1315,8 +1812,23 @@ class HostApp:
             self.tray.stop()
         self.root.destroy()
 
+    def _main_menu(self):
+        from tkinter import messagebox
+        text = ("Stop sharing this PC from this window and go back to the main menu?"
+                + ("\n\nA viewer is connected and will be disconnected." if self.svc.session else "")
+                + ("\n\nThe admin service keeps sharing this PC." if service_setup.state() == "running" else ""))
+        if not messagebox.askyesno(APP, text, parent=self.root):
+            return
+        self.back_to_menu = True
+        self.svc.stop()
+        if self.tray:
+            self.tray.stop()
+        self.root.destroy()
+
     def _quit(self):
         from tkinter import messagebox
+        if not unlock(self.root, "quit"):
+            return
         if self.svc.session and not messagebox.askyesno(APP, "A viewer is connected. Stop hosting?"):
             return
         self.svc.stop()
@@ -1329,8 +1841,6 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--nogui", action="store_true")
     ap.add_argument("--service-agent", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--relay", help="relay host:port (saved to config)")
-    ap.add_argument("--relay-key", help="relay shared key (saved to config)")
     ap.add_argument("--listen", type=int, help="also accept direct connections on this port (saved)")
     ap.add_argument("--set-password", help="set a specific password (use a long one!)")
     ap.add_argument("--minimized", action="store_true", help="start hidden in the system tray")
@@ -1342,11 +1852,6 @@ def main(argv=None):
     if args.service_agent:
         cfg["allow_update"] = False
         cfg["allow_files"] = False
-        cfg["allow_clipboard"] = False
-    if args.relay is not None:
-        cfg["relay"] = args.relay
-    if args.relay_key is not None:
-        cfg["relay_key"] = args.relay_key
     if args.listen is not None:
         cfg["listen"] = args.listen
     if args.set_password:
@@ -1370,10 +1875,19 @@ def main(argv=None):
 
     import tkinter as tk
     root = tk.Tk()
+    try:
+        import logo
+        logo.tk_icon(root)
+    except Exception:
+        pass
+    import ui
+    ui.apply(root)
     app = HostApp(root, service)
     if args.minimized and app.tray:
         app.hide()
+    ui.reveal(root)
     root.mainloop()
+    return app.back_to_menu
 
 
 if __name__ == "__main__":

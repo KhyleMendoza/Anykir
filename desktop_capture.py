@@ -38,7 +38,7 @@ class DesktopCapture:
     def grab(self, index):
         displays = monitors()
         index = min(max(int(index), 0), len(displays) - 1)
-        image = ImageGrab.grab(all_screens=True, include_layered_windows=True)
+        image = ImageGrab.grab(all_screens=True, include_layered_windows=False)
         virtual, monitor = displays[0], displays[index]
         if image.size != (virtual["width"], virtual["height"]):
             raise OSError("Display geometry changed during capture; retrying")

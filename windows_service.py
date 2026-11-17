@@ -9,7 +9,8 @@ import time
 
 SERVICE_NAME = "AnyKir"
 VERSION_FILE = "version.txt"
-NETWORK_FIELDS = ("id", "secret", "relay", "relay_key", "listen")
+FOLLOW_FILE = "follow.txt"
+NETWORK_FIELDS = ("id", "secret", "listen", "hubs", "address", "only_address")
 
 
 def data_dir():
@@ -17,7 +18,16 @@ def data_dir():
 
 
 def install_dir():
-    return os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "AnyKirService")
+    root = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles", r"C:\Program Files")
+    return os.path.join(root, "AnyKirService")
+
+
+def installed_follow():
+    try:
+        with open(os.path.join(install_dir(), FOLLOW_FILE), encoding="utf-8") as f:
+            return f.read(1024).strip() or None
+    except OSError:
+        return None
 
 
 def installed_version():
@@ -41,25 +51,73 @@ def read_app_config(path):
         v = data.get(key)
         if isinstance(v, str) and shortest <= len(v) <= 256:
             out[key] = v
-    for key in ("relay", "relay_key"):
-        v = data.get(key)
-        if isinstance(v, str) and len(v) <= 255:
-            out[key] = v
     v = data.get("listen")
-    if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 65535:
+    if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535:
         out["listen"] = v
-    if isinstance(data.get("allow_input"), bool):
-        out["allow_input"] = data["allow_input"]
+    for key in ("allow_input", "allow_clipboard"):
+        if isinstance(data.get(key), bool):
+            out[key] = data[key]
+    if isinstance(data.get("only_address"), bool):
+        out["only_address"] = data["only_address"]
+    if isinstance(data.get("address"), str):
+        try:
+            import ipaddress
+            out["address"] = str(ipaddress.IPv4Address(data["address"].strip()))
+        except ValueError:
+            pass
+    if data.get("allow_from_mode") in ("all", "list"):
+        out["allow_from_mode"] = data["allow_from_mode"]
+    if isinstance(data.get("allow_from"), list):
+        from common import clean_allow_list
+        out["allow_from"] = clean_allow_list([str(v)[:64] for v in data["allow_from"][:256]])[0]
+    if isinstance(data.get("hubs"), list):
+        from hub import clean_hubs
+        out["hubs"] = clean_hubs(data["hubs"])
     return out
+
+
+NO_WINDOW = 0x08000000
+REMOVE_BLOCK_RULES = ("Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | "
+                      "Where-Object { $_.Program -like '*AnyKir*' } | Get-NetFirewallRule | "
+                      "Where-Object { $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' } | "
+                      "Remove-NetFirewallRule")
+
+
+def _netsh(*args):
+    netsh = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "netsh.exe")
+    return subprocess.run([netsh, "advfirewall", "firewall", *args], capture_output=True, text=True,
+                          creationflags=NO_WINDOW)
+
+
+def open_firewall(port):
+    _netsh("delete", "rule", "name=AnyKir")
+    ok = _netsh("add", "rule", "name=AnyKir", "dir=in", "action=allow", "protocol=TCP",
+                f"localport={int(port)},7002", "profile=any").returncode == 0
+    _netsh("delete", "rule", "name=AnyKir ping")
+    _netsh("add", "rule", "name=AnyKir ping", "dir=in", "action=allow", "protocol=icmpv4:8,any", "profile=any")
+    powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    try:
+        subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command", REMOVE_BLOCK_RULES],
+                       capture_output=True, creationflags=NO_WINDOW, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ok
+
+
+def firewall_ready(port):
+    try:
+        out = _netsh("show", "rule", "name=AnyKir").stdout
+    except OSError:
+        return False
+    enabled = re.search(r"^Enabled:\s+Yes", out, re.M)
+    ports = re.search(r"^LocalPort:\s+(\S+)", out, re.M)
+    return bool(enabled and ports and str(int(port)) in ports.group(1).split(","))
 
 
 def apply_app_config(service, new):
     from common import derive_key, save_json
     changes = {k: v for k, v in new.items() if service.cfg.get(k) != v}
-    merged = dict(service.cfg, **changes)
-    if not merged.get("listen") and not merged.get("relay"):
-        changes.pop("listen", None)
-        changes.pop("relay", None)
     if not changes:
         return {}
     service.cfg.update(changes)
@@ -70,12 +128,21 @@ def apply_app_config(service, new):
         session.injector.enabled = service.cfg["allow_input"]
         if not service.cfg["allow_input"]:
             session.injector.release_all()
+    if "listen" in changes:
+        try:
+            open_firewall(service.cfg["listen"])
+        except OSError:
+            pass
     if any(k in changes for k in NETWORK_FIELDS):
         service.restart_network()
     return changes
 
 
 def follow_app(service, interval=5):
+    try:
+        open_firewall(service.cfg.get("listen") or 7001)
+    except OSError:
+        pass
     path = service.cfg.get("follow")
     if not path:
         return
@@ -102,6 +169,7 @@ def check_self_update():
         meta = json.loads(f.read(4096).decode("utf-8"))
     version, sig = str(meta.get("version", "")), str(meta.get("sig", ""))
     if not updater.newer(version, VERSION):
+        shutil.rmtree(os.path.join(data_dir(), "update"), ignore_errors=True)
         return False
     attempt_file = os.path.join(data_dir(), "update_attempt.json")
     try:
@@ -130,7 +198,6 @@ def is_system():
     import win32api
     import win32con
     import win32security
-    # pywin32 handles are not context managers; close them explicitly.
     token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
     try:
         sid, _ = win32security.GetTokenInformation(token, win32security.TokenUser)
@@ -139,17 +206,80 @@ def is_system():
         token.Close()
 
 
+SAS_EVENT = r"Global\AnyKirSAS"
+SAS_POLICY_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+
+
+def allow_software_sas():
+    import winreg
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, SAS_POLICY_KEY, 0,
+                                winreg.KEY_READ | winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+            try:
+                value, _ = winreg.QueryValueEx(key, "SoftwareSASGeneration")
+            except OSError:
+                value = None
+            if value not in (1, 3):
+                winreg.SetValueEx(key, "SoftwareSASGeneration", 0, winreg.REG_DWORD, 3)
+        return True
+    except OSError:
+        return False
+
+
+def send_sas():
+    import ctypes
+    allow_software_sas()
+    ctypes.WinDLL("sas.dll").SendSAS(False)
+
+
+def request_sas():
+    import win32event
+    try:
+        event = win32event.OpenEvent(0x0002, False, SAS_EVENT)
+    except Exception:
+        send_sas()
+        return
+    try:
+        win32event.SetEvent(event)
+    finally:
+        event.Close()
+
+
+def _sas_event():
+    import pywintypes
+    import win32event
+    import win32security
+    sa = pywintypes.SECURITY_ATTRIBUTES()
+    sa.SECURITY_DESCRIPTOR = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+        "D:P(A;;GA;;;SY)", win32security.SDDL_REVISION_1)
+    return win32event.CreateEvent(sa, False, False, SAS_EVENT)
+
+
 def run_agent():
     if not is_system():
         raise PermissionError("The UAC agent must be started by the installed AnyKir service.")
     from common import set_config_dir
     set_config_dir(data_dir())
     if not os.path.isfile(os.path.join(data_dir(), "host.json")):
-        raise RuntimeError("Service configuration is missing. Run install-service.ps1 first.")
+        raise RuntimeError("Service configuration is missing. Click Install admin service in AnyKir first.")
     import windows_desktop
     windows_desktop.enabled = True
     import host
     host.main(["--nogui", "--service-agent"])
+
+
+def stop_everything():
+    import win32serviceutil
+    taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+    try:
+        subprocess.run([taskkill, "/F", "/T", "/IM", "AnyKir.exe"], capture_output=True,
+                       creationflags=0x08000000, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        win32serviceutil.StopService(SERVICE_NAME)
+    except Exception:
+        pass
 
 
 def console_session():
@@ -189,8 +319,6 @@ def launch_agent(session):
                 env, os.path.dirname(sys.executable), startup)
             job = None
             try:
-                # A job owns the agent's whole process tree, so stopping the service kills it all.
-                # pywin32 wants "" (not None) for an unnamed job object.
                 job = win32job.CreateJobObject(None, "")
                 limits = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
                 limits["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -273,11 +401,39 @@ def dispatch():
                 from common import VERSION
                 with open(os.path.join(install_dir(), VERSION_FILE), "w", encoding="ascii") as f:
                     f.write(VERSION)
-            except OSError:
+                with open(os.path.join(data_dir(), "host.json"), encoding="utf-8") as f:
+                    follow = str(json.load(f).get("follow") or "")
+                with open(os.path.join(install_dir(), FOLLOW_FILE), "w", encoding="utf-8") as f:
+                    f.write(follow)
+            except (OSError, ValueError):
                 pass
+            allow_software_sas()
+
+            def clean():
+                try:
+                    import cleanup
+                    cleanup.clean_temp(cleanup.system_temp_dirs())
+                    cleanup.clean_setup_leftovers()
+                except Exception:
+                    pass
+            threading.Thread(target=clean, daemon=True).start()
+            try:
+                sas = _sas_event()
+            except Exception:
+                sas = None
+            events = [self.stop_event] + ([sas] if sas else [])
             ticks = 0
             try:
-                while win32event.WaitForSingleObject(self.stop_event, 2000) == win32event.WAIT_TIMEOUT:
+                while True:
+                    woke = win32event.WaitForMultipleObjects(events, False, 2000)
+                    if woke == win32event.WAIT_OBJECT_0:
+                        break
+                    if woke == win32event.WAIT_OBJECT_0 + 1:
+                        try:
+                            send_sas()
+                        except Exception as exc:
+                            servicemanager.LogErrorMsg("AnyKir Ctrl+Alt+Del: " + str(exc))
+                        continue
                     ticks += 1
                     if ticks % 30 == 5:
                         try:
@@ -295,6 +451,8 @@ def dispatch():
                             last_error = message
             finally:
                 supervisor.stop()
+                if sas:
+                    sas.Close()
                 self.stop_event.Close()
 
     if not is_system():

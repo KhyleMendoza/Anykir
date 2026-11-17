@@ -13,6 +13,23 @@ DESKTOP_ACCESS = (DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW | DESKTOP_JOURNALPL
                   | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP)
 
 
+def input_is_default(api=None):
+    if api is None:
+        if not enabled or sys.platform != "win32":
+            return True
+        api = _DesktopAPI()
+    try:
+        handle = api.open_input()
+    except OSError:
+        return False
+    try:
+        return api.name(handle).lower() == "default"
+    except OSError:
+        return False
+    finally:
+        api.close(handle)
+
+
 class DesktopBinding:
 
     def __init__(self, api=None):
@@ -75,7 +92,6 @@ class _DesktopAPI:
         return self.u.GetThreadDesktop(self.k.GetCurrentThreadId())
 
     def open_input(self):
-        # Without DESKTOP_JOURNALPLAYBACK Windows silently drops clicks/keys; only cursor moves work.
         h = self.u.OpenInputDesktop(0, False, DESKTOP_ACCESS)
         if not h:
             raise ctypes.WinError(ctypes.get_last_error())
